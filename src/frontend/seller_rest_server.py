@@ -1,0 +1,176 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import grpc
+import os
+
+from src.proto import customer_pb2, customer_pb2_grpc
+from src.proto import product_pb2, product_pb2_grpc
+
+app = FastAPI()
+
+# -------------------------------------------------
+# VM Configurable gRPC Connections
+# Seller account ops → Customer DB port 50053
+# Product ops        → Product DB port 50052
+# -------------------------------------------------
+
+CUSTOMER_HOST        = os.getenv("CUSTOMER_HOST",        "localhost")
+PRODUCT_HOST         = os.getenv("PRODUCT_HOST",         "localhost")
+CUSTOMER_SELLER_PORT = int(os.getenv("CUSTOMER_SELLER_PORT", "50053"))
+PRODUCT_PORT         = int(os.getenv("PRODUCT_PORT",         "50052"))
+
+customer_channel = grpc.insecure_channel(f"{CUSTOMER_HOST}:{CUSTOMER_SELLER_PORT}")
+product_channel  = grpc.insecure_channel(f"{PRODUCT_HOST}:{PRODUCT_PORT}")
+
+customer_stub = customer_pb2_grpc.CustomerServiceStub(customer_channel)
+product_stub  = product_pb2_grpc.ProductServiceStub(product_channel)
+
+# -------------------------------------------------
+# Request Models
+# -------------------------------------------------
+
+class AccountRequest(BaseModel):
+    username: str
+    password: str
+
+class SessionRequest(BaseModel):
+    session_token: str
+
+class RegisterItemRequestModel(BaseModel):
+    session_token: str
+    name: str
+    category: int
+    price: float
+    quantity: int
+
+class ChangePriceRequestModel(BaseModel):
+    session_token: str
+    item_id: str
+    new_price: float
+
+class UpdateQuantityRequestModel(BaseModel):
+    session_token: str
+    item_id: str
+    quantity: int
+
+class SellerRatingRequest(BaseModel):
+    session_token: str
+    seller_id: int
+
+# -------------------------------------------------
+# Account APIs
+# -------------------------------------------------
+
+@app.post("/seller/create_account")
+def create_account(req: AccountRequest):
+    try:
+        response = customer_stub.CreateAccount(
+            customer_pb2.CreateAccountRequest(
+                username=req.username, password=req.password
+            )
+        )
+        return {"seller_id": response.user_id}
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=400, detail=e.details())
+
+
+@app.post("/seller/login")
+def login(req: AccountRequest):
+    try:
+        response = customer_stub.Login(
+            customer_pb2.LoginRequest(
+                username=req.username, password=req.password
+            )
+        )
+        return {"session_token": response.session_token, "seller_id": response.user_id}
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=401, detail=e.details())
+
+
+@app.post("/seller/logout")
+def logout(req: SessionRequest):
+    try:
+        customer_stub.Logout(
+            customer_pb2.SessionRequest(session_token=req.session_token)
+        )
+        return {"status": "logged_out"}
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=400, detail=e.details())
+
+
+# -------------------------------------------------
+# Seller Product Management
+# -------------------------------------------------
+
+@app.post("/seller/register_item")
+def register_item(req: RegisterItemRequestModel):
+    try:
+        response = product_stub.RegisterItem(
+            product_pb2.RegisterItemRequest(
+                name=req.name, category=req.category,
+                price=req.price, quantity=req.quantity,
+                session_token=req.session_token
+            )
+        )
+        return {"item_id": response.item_id}
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=400, detail=e.details())
+
+
+@app.post("/seller/change_price")
+def change_price(req: ChangePriceRequestModel):
+    try:
+        product_stub.ChangePrice(
+            product_pb2.ChangePriceRequest(
+                item_id=req.item_id, new_price=req.new_price,
+                session_token=req.session_token
+            )
+        )
+        return {"status": "price_updated"}
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=400, detail=e.details())
+
+
+@app.post("/seller/update_quantity")
+def update_quantity(req: UpdateQuantityRequestModel):
+    try:
+        product_stub.UpdateQuantity(
+            product_pb2.UpdateQuantityRequest(
+                item_id=req.item_id, quantity=req.quantity,
+                session_token=req.session_token
+            )
+        )
+        return {"status": "quantity_updated"}
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=400, detail=e.details())
+
+
+@app.post("/seller/display_items")
+def display_items(req: SessionRequest):
+    try:
+        response = product_stub.DisplayItemsForSale(
+            product_pb2.SessionRequest(session_token=req.session_token)
+        )
+        return {
+            "items": [
+                {"item_id": item.item_id, "name": item.name,
+                 "price": item.price, "quantity": item.quantity}
+                for item in response.items
+            ]
+        }
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=400, detail=e.details())
+
+
+@app.post("/seller/get_rating")
+def get_rating(req: SellerRatingRequest):
+    try:
+        response = customer_stub.GetSellerRating(
+            customer_pb2.SessionSellerRequest(
+                session_token=req.session_token,
+                seller_id=req.seller_id
+            )
+        )
+        return {"thumbs_up": response.thumbs_up, "thumbs_down": response.thumbs_down}
+    except grpc.RpcError as e:
+        raise HTTPException(status_code=400, detail=e.details())

@@ -39,6 +39,7 @@ class AppConfig:
     frontend_seller: EndpointConfig
     backend_customer_db: EndpointConfig
     backend_product_db: EndpointConfig
+    soap: EndpointConfig
     session: SessionConfig
     features: FeatureConfig
     storage: StorageConfig
@@ -62,8 +63,9 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(
         frontend_buyer=_endpoint(raw, "frontend_buyer", 5100),
         frontend_seller=_endpoint(raw, "frontend_seller", 5200),
-        backend_customer_db=_endpoint(raw, "backend_customer_db", 5300),
-        backend_product_db=_endpoint(raw, "backend_product_db", 5400),
+        backend_customer_db=_endpoint(raw, "backend_customer_db", 50051),
+        backend_product_db=_endpoint(raw, "backend_product_db", 50052),
+        soap=_endpoint(raw, "soap", 8000),
         session=SessionConfig(timeout_seconds=int(session_raw.get("timeout_seconds", 300))),
         features=FeatureConfig(enable_make_purchase=bool(features_raw.get("enable_make_purchase", False))),
         storage=StorageConfig(data_dir=Path(storage_raw.get("data_dir", "./data"))),

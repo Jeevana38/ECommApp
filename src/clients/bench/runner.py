@@ -1,26 +1,38 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import random
 import statistics
 import time
+import secrets
+import concurrent.futures
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.common.config import load_config
 from src.clients.client_base import MarketplaceClient
 
-import secrets
 RUN_TAG = secrets.token_hex(3)
 
 # ----------------------------
-# Benchmark / Evaluation runner
+# Benchmark / Evaluation runner (PA2 - REST version)
 # ----------------------------
 #
 # - each run: each client invokes 1000 API functions
 # - scenarios: (1,1), (10,10), (100,100) sellers/buyers
 #
+# Seller API coverage:
+#   CreateAccount, Login, Logout,
+#   RegisterItemForSale, ChangeItemPrice, UpdateUnitsForSale,
+#   DisplayItemsForSale, GetSellerRating
+#
+# Buyer API coverage:
+#   CreateAccount, Login, Logout,
+#   SearchItemsForSale, GetItem, AddItemToCart, RemoveItemFromCart,
+#   DisplayCart, SaveCart, ClearCart,
+#   ProvideFeedback, GetSellerRating, GetBuyerPurchases,
+#   MakePurchase
 
 
 @dataclass
@@ -57,189 +69,348 @@ class Stats:
         return xs[k]
 
 
-async def timed_call(client: MarketplaceClient, action: str, payload: Dict[str, Any], stats: Stats) -> Dict[str, Any]:
+# --------------------------------------------------
+# Timed REST call helper
+# --------------------------------------------------
+
+def timed_call(
+    client: MarketplaceClient,
+    endpoint: str,
+    payload: Dict[str, Any],
+    stats: Stats,
+) -> Dict[str, Any]:
     t0 = time.perf_counter()
-    resp = await client.request(action, payload)
+    try:
+        resp = client._post(endpoint, payload)
+        ok = True
+    except Exception:
+        resp = {}
+        ok = False
     t1 = time.perf_counter()
-    stats.add(t1 - t0, bool(resp.get("ok")))
+    stats.add(t1 - t0, ok)
     return resp
 
+
 def _mk_kw(rng: random.Random) -> List[str]:
-    # matches setup keywords: k1..k5
     return [f"k{rng.randint(1, 5)}"]
 
 
-def _mk_item_id_key(item_id: Any) -> Any:
-    # item_id is usually {"category": int, "number": int}
-    # Keep as-is (JSON-friendly) for requests.
-    return item_id
+# --------------------------------------------------
+# Seller workload
+# Full API: CreateAccount, Login, RegisterItem, ChangePrice,
+#           UpdateQuantity, DisplayItems, GetSellerRating, Logout
+# --------------------------------------------------
 
-
-async def seller_workload(
-    host: str,
-    port: int,
+def seller_workload(
+    base_url: str,
     seller_idx: int,
     run_idx: int,
     ops_per_client: int,
     items_per_seller: int,
     rng_seed: int,
-    shared_item_ids: List[Dict[str, Any]],
-    shared_item_ids_lock: asyncio.Lock,
-) -> Tuple[Stats, List[Dict[str, Any]]]:
-    """
-    Each seller performs exactly ops_per_client API calls:
-      1) CreateAccount
-      2) Login
-      3) RegisterItemForSale (items_per_seller times)
-      4) Remaining ops: DisplayItemsForSale / ChangeItemPrice / UpdateUnitsForSale
-      5) Logout (last call)
-    """
+    shared_item_ids: List[str],
+    shared_seller_ids: List[int],
+    shared_lock: threading.Lock,
+) -> Tuple[Stats, List[str]]:
+
     rng = random.Random(rng_seed)
     stats = Stats()
-    created_item_ids: List[Dict[str, Any]] = []
+    created_item_ids: List[str] = []
 
-    c = MarketplaceClient(host, port, role="seller")
-    await c.connect()
-    try:
-        username = f"seller_{RUN_TAG}_r{run_idx}_{seller_idx}"
-        await timed_call(c, "CreateAccount", {"username": username, "password": "pw"}, stats)
-        r = await timed_call(c, "Login", {"username": username, "password": "pw"}, stats)
-        c.session_token = r.get("data", {}).get("session_token")
+    client = MarketplaceClient(base_url)
+    username = f"seller_{RUN_TAG}_r{run_idx}_{seller_idx}"
 
-        # Register a few items with large inventory to reduce "unavailable" errors in big scenarios.
-        for j in range(items_per_seller):
-            category = rng.randint(1, 3)
-            name = f"item_s{seller_idx}_r{run_idx}_{j}"
-            cond = "new" if (j % 2 == 0) else "used"
-            price = float(rng.randint(10, 100))
-            qty = rng.randint(5000, 12000)  # large so add-to-cart stays available
-            rr = await timed_call(
-                c,
-                "RegisterItemForSale",
-                {
-                    "item_name": name,
-                    "item_category": category,
-                    "keywords": _mk_kw(rng),
-                    "condition": cond,
-                    "sale_price": price,
-                    "item_quantity": qty,
-                },
+    # 1) CreateAccount
+    ca_resp = timed_call(
+        client, "seller/create_account",
+        {"username": username, "password": "pw"},
+        stats,
+    )
+
+    # 2) Login
+    resp = timed_call(
+        client, "seller/login",
+        {"username": username, "password": "pw"},
+        stats,
+    )
+    session_token = resp.get("session_token", "")
+    seller_id = resp.get("seller_id")
+    client.set_session(session_token)
+
+    # Publish seller_id to shared pool for buyers to use GetSellerRating
+    if seller_id:
+        with shared_lock:
+            shared_seller_ids.append(int(seller_id))
+
+    # 3) RegisterItemForSale
+    for j in range(items_per_seller):
+        category = rng.randint(1, 3)
+        name = f"item_s{seller_idx}_r{run_idx}_{j}"
+        price = float(rng.randint(10, 100))
+        qty = rng.randint(5000, 12000)
+        rr = timed_call(
+            client, "seller/register_item",
+            {
+                "name": name,
+                "category": category,
+                "price": price,
+                "quantity": qty,
+                "session_token": session_token,
+            },
+            stats,
+        )
+        item_id = rr.get("item_id")
+        if item_id:
+            created_item_ids.append(item_id)
+
+    # Publish item_ids to shared pool for buyers
+    if created_item_ids:
+        with shared_lock:
+            shared_item_ids.extend(created_item_ids)
+
+    # 4) Remaining ops — weighted mix of all seller APIs
+    used_ops = 2 + items_per_seller
+    remaining = ops_per_client - used_ops - 1  # reserve 1 for Logout
+
+    for _ in range(max(0, remaining)):
+        p = rng.random()
+
+        if p < 0.50:
+            # DisplayItemsForSale
+            timed_call(
+                client, "seller/display_items",
+                {"session_token": session_token},
                 stats,
             )
-            if rr.get("ok") and rr.get("data", {}).get("item_id"):
-                iid = rr["data"]["item_id"]
-                created_item_ids.append(iid)
 
-        # Publish created items to shared pool for buyers.
-        if created_item_ids:
-            async with shared_item_ids_lock:
-                shared_item_ids.extend(created_item_ids)
+        elif p < 0.75 and created_item_ids:
+            # ChangeItemPrice
+            iid = rng.choice(created_item_ids)
+            new_price = float(rng.randint(5, 200))
+            timed_call(
+                client, "seller/change_price",
+                {"item_id": iid, "new_price": new_price, "session_token": session_token},
+                stats,
+            )
 
-        # avoid draining inventory too fast with UpdateUnitsForSale
-        used_ops = 2 + items_per_seller
-        remaining = ops_per_client - used_ops - 1  # reserve 1 for Logout
-        for _ in range(max(0, remaining)):
-            p = rng.random()
-            if p < 0.65:
-                await timed_call(c, "DisplayItemsForSale", {}, stats)
-            elif p < 0.95 and created_item_ids:
-                iid = _mk_item_id_key(rng.choice(created_item_ids))
-                new_price = float(rng.randint(5, 200))
-                await timed_call(c, "ChangeItemPrice", {"item_id": iid, "sale_price": new_price}, stats)
+        elif p < 0.90 and created_item_ids:
+            # UpdateUnitsForSale
+            iid = rng.choice(created_item_ids)
+            timed_call(
+                client, "seller/update_quantity",
+                {"item_id": iid, "quantity": 1, "session_token": session_token},
+                stats,
+            )
+
+        else:
+            # GetSellerRating (seller checks their own rating)
+            if seller_id:
+                timed_call(
+                    client, "seller/get_rating",
+                    {"session_token": session_token, "seller_id": int(seller_id)},
+                    stats,
+                )
             else:
-                # low-frequency inventory reduction
-                if created_item_ids:
-                    iid = _mk_item_id_key(rng.choice(created_item_ids))
-                    await timed_call(c, "UpdateUnitsForSale", {"item_id": iid, "remove_quantity": 1}, stats)
-                else:
-                    await timed_call(c, "DisplayItemsForSale", {}, stats)
+                timed_call(
+                    client, "seller/display_items",
+                    {"session_token": session_token},
+                    stats,
+                )
 
-        await timed_call(c, "Logout", {}, stats)
-    finally:
-        await c.close()
+    # 5) Logout
+    timed_call(
+        client, "seller/logout",
+        {"session_token": session_token},
+        stats,
+    )
 
     return stats, created_item_ids
 
 
-async def buyer_workload(
-    host: str,
-    port: int,
+# --------------------------------------------------
+# Buyer workload
+# Full API: CreateAccount, Login, Logout,
+#           SearchItemsForSale, GetItem, AddItemToCart,
+#           RemoveItemFromCart, DisplayCart, SaveCart, ClearCart,
+#           ProvideFeedback, GetSellerRating, GetBuyerPurchases,
+#           MakePurchase
+# --------------------------------------------------
+
+def buyer_workload(
+    base_url: str,
     buyer_idx: int,
     run_idx: int,
     ops_per_client: int,
     rng_seed: int,
-    shared_item_ids: List[Dict[str, Any]],
+    shared_item_ids: List[str],
+    shared_seller_ids: List[int],
 ) -> Stats:
-    """
-    Each buyer performs exactly ops_per_client API calls:
-      1) CreateAccount
-      2) Login
-      3) Remaining ops: Search / GetItem / AddItemToCart / RemoveItemFromCart / DisplayCart /
-                        SaveCart / ClearCart / ProvideFeedback / GetSellerRating
-      4) Logout (last call)
-    """
+
     rng = random.Random(rng_seed)
     stats = Stats()
 
-    c = MarketplaceClient(host, port, role="buyer")
-    await c.connect()
-    try:
-        username = f"buyer_{RUN_TAG}_r{run_idx}_{buyer_idx}"
-        await timed_call(c, "CreateAccount", {"username": username, "password": "pw"}, stats)
-        r = await timed_call(c, "Login", {"username": username, "password": "pw"}, stats)
-        c.session_token = r.get("data", {}).get("session_token")
+    client = MarketplaceClient(base_url)
+    username = f"buyer_{RUN_TAG}_r{run_idx}_{buyer_idx}"
 
-        used_ops = 2
-        remaining = ops_per_client - used_ops - 1  # reserve 1 for Logout
+    # 1) CreateAccount
+    timed_call(
+        client, "buyer/create_account",
+        {"username": username, "password": "pw"},
+        stats,
+    )
 
-        for _ in range(max(0, remaining)):
-            p = rng.random()
+    # 2) Login
+    resp = timed_call(
+        client, "buyer/login",
+        {"username": username, "password": "pw"},
+        stats,
+    )
+    session_token = resp.get("session_token", "")
+    client.set_session(session_token)
 
-            # pick an item (best-effort). Buyers can run before sellers have published items;
-            # in that case, fall back to Search/DisplayCart.
-            iid: Optional[Dict[str, Any]] = rng.choice(shared_item_ids) if shared_item_ids else None
+    # 3) Remaining ops — weighted mix of ALL buyer APIs
+    used_ops = 2
+    remaining = ops_per_client - used_ops - 1  # reserve 1 for Logout
 
-            if p < 0.30:
-                cat = rng.randint(1, 3)
-                await timed_call(c, "SearchItemsForSale", {"item_category": cat, "keywords": _mk_kw(rng)}, stats)
+    # Track whether we've added anything to cart (for MakePurchase to work)
+    cart_has_items = False
 
-            elif p < 0.50 and iid:
-                await timed_call(c, "GetItem", {"item_id": _mk_item_id_key(iid)}, stats)
+    for _ in range(max(0, remaining)):
+        p = rng.random()
+        iid: Optional[str] = rng.choice(shared_item_ids) if shared_item_ids else None
+        sid: Optional[int] = rng.choice(shared_seller_ids) if shared_seller_ids else None
 
-            elif p < 0.70 and iid:
-                await timed_call(c, "AddItemToCart", {"item_id": _mk_item_id_key(iid), "quantity": 1}, stats)
+        if p < 0.22:
+            # SearchItemsForSale
+            cat = rng.randint(1, 3)
+            timed_call(
+                client, "buyer/search",
+                {"item_category": cat, "session_token": session_token},
+                stats,
+            )
 
-            elif p < 0.80 and iid:
-                await timed_call(c, "RemoveItemFromCart", {"item_id": _mk_item_id_key(iid), "quantity": 1}, stats)
+        elif p < 0.35 and iid:
+            # GetItem
+            timed_call(
+                client, "buyer/get_item",
+                {"item_id": iid, "session_token": session_token},
+                stats,
+            )
 
-            elif p < 0.88:
-                await timed_call(c, "DisplayCart", {}, stats)
+        elif p < 0.50 and iid:
+            # AddItemToCart
+            timed_call(
+                client, "buyer/add_to_cart",
+                {"item_id": iid, "quantity": 1, "session_token": session_token},
+                stats,
+            )
+            cart_has_items = True
 
-            elif p < 0.93:
-                await timed_call(c, "SaveCart", {}, stats)
+        elif p < 0.60 and iid:
+            # RemoveItemFromCart
+            timed_call(
+                client, "buyer/remove_from_cart",
+                {"item_id": iid, "quantity": 1, "session_token": session_token},
+                stats,
+            )
 
-            elif p < 0.96:
-                await timed_call(c, "ClearCart", {}, stats)
+        elif p < 0.68:
+            # DisplayCart
+            timed_call(
+                client, "buyer/display_cart",
+                {"session_token": session_token},
+                stats,
+            )
 
-            elif p < 0.99 and iid:
-                vote = "up" if rng.random() < 0.7 else "down"
-                await timed_call(c, "ProvideFeedback", {"item_id": _mk_item_id_key(iid), "vote": vote}, stats)
+        elif p < 0.74:
+            # SaveCart
+            timed_call(
+                client, "buyer/save_cart",
+                {"session_token": session_token},
+                stats,
+            )
 
+        elif p < 0.79:
+            # ClearCart
+            timed_call(
+                client, "buyer/clear_cart",
+                {"session_token": session_token},
+                stats,
+            )
+            cart_has_items = False
+
+        elif p < 0.86 and iid:
+            # ProvideFeedback
+            vote = "up" if rng.random() < 0.7 else "down"
+            timed_call(
+                client, "buyer/provide_feedback",
+                {"item_id": iid, "feedback": vote, "session_token": session_token},
+                stats,
+            )
+
+        elif p < 0.91 and sid:
+            # GetSellerRating
+            timed_call(
+                client, "buyer/get_seller_rating",
+                {"seller_id": sid, "session_token": session_token},
+                stats,
+            )
+
+        elif p < 0.95:
+            # GetBuyerPurchases
+            timed_call(
+                client, "buyer/get_purchases",
+                {"session_token": session_token},
+                stats,
+            )
+
+        else:
+            # MakePurchase (PA2) — only if cart likely has items
+            # Uses dummy card; SOAP will approve ~90% of the time
+            if cart_has_items and iid:
+                # Ensure something is in cart before purchasing
+                timed_call(
+                    client, "buyer/add_to_cart",
+                    {"item_id": iid, "quantity": 1, "session_token": session_token},
+                    stats,
+                )
+                timed_call(
+                    client, "buyer/make_purchase",
+                    {
+                        "session_token": session_token,
+                        "card_name": "Bench User",
+                        "card_number": "4111111111111111",
+                        "expiration": "12/30",
+                        "security_code": "123",
+                    },
+                    stats,
+                )
+                cart_has_items = False
             else:
-                await timed_call(c, "SearchItemsForSale", {"item_category": rng.randint(1, 3), "keywords": []}, stats)
+                # Fallback to search if cart is empty
+                timed_call(
+                    client, "buyer/search",
+                    {"item_category": rng.randint(1, 3), "session_token": session_token},
+                    stats,
+                )
 
-        await timed_call(c, "Logout", {}, stats)
-    finally:
-        await c.close()
+    # 4) Logout
+    timed_call(
+        client, "buyer/logout",
+        {"session_token": session_token},
+        stats,
+    )
 
     return stats
 
 
-async def run_one(
-    buyers_host: str,
-    buyers_port: int,
-    sellers_host: str,
-    sellers_port: int,
+# --------------------------------------------------
+# Run one benchmark round
+# --------------------------------------------------
+
+def run_one(
+    buyer_base_url: str,
+    seller_base_url: str,
     n_buyers: int,
     n_sellers: int,
     ops_per_client: int,
@@ -247,54 +418,57 @@ async def run_one(
     seed: int,
     run_idx: int,
 ) -> Tuple[float, float, Stats]:
-    """
-    Returns: (avg_response_time_seconds, throughput_ops_per_sec, aggregated_stats)
-    """
-    # shared pool of item ids produced by sellers for buyers to touch
-    shared_item_ids: List[Dict[str, Any]] = []
-    lock = asyncio.Lock()
 
-    # Start sellers and buyers concurrently to simulate real load.
-    # Buyers do not require sellers to finish; search will return whatever exists.
-    seller_tasks = [
-        seller_workload(
-            sellers_host,
-            sellers_port,
-            seller_idx=i,
-            run_idx=run_idx,
-            ops_per_client=ops_per_client,
-            items_per_seller=items_per_seller,
-            rng_seed=seed + 1000 + i,
-            shared_item_ids=shared_item_ids,
-            shared_item_ids_lock=lock,
-        )
-        for i in range(n_sellers)
-    ]
-    buyer_tasks = [
-        buyer_workload(
-            buyers_host,
-            buyers_port,
-            buyer_idx=i,
-            run_idx=run_idx,
-            ops_per_client=ops_per_client,
-            rng_seed=seed + 2000 + i,
-            shared_item_ids=shared_item_ids,
-        )
-        for i in range(n_buyers)
-    ]
+    shared_item_ids: List[str] = []
+    shared_seller_ids: List[int] = []
+    shared_lock = threading.Lock()
+
+    seller_futures = []
+    buyer_futures = []
 
     t0 = time.perf_counter()
-    seller_results = await asyncio.gather(*seller_tasks)
-    buyer_stats = await asyncio.gather(*buyer_tasks)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_sellers + n_buyers) as executor:
+
+        for i in range(n_sellers):
+            f = executor.submit(
+                seller_workload,
+                seller_base_url,
+                i,
+                run_idx,
+                ops_per_client,
+                items_per_seller,
+                seed + 1000 + i,
+                shared_item_ids,
+                shared_seller_ids,
+                shared_lock,
+            )
+            seller_futures.append(f)
+
+        for i in range(n_buyers):
+            f = executor.submit(
+                buyer_workload,
+                buyer_base_url,
+                i,
+                run_idx,
+                ops_per_client,
+                seed + 2000 + i,
+                shared_item_ids,
+                shared_seller_ids,
+            )
+            buyer_futures.append(f)
+
     t1 = time.perf_counter()
 
     # Aggregate
     all_stats = Stats()
-    for st, _created in seller_results:
+    for f in seller_futures:
+        st, _ = f.result()
         all_stats.latencies.extend(st.latencies)
         all_stats.ok += st.ok
         all_stats.err += st.err
-    for st in buyer_stats:
+    for f in buyer_futures:
+        st = f.result()
         all_stats.latencies.extend(st.latencies)
         all_stats.ok += st.ok
         all_stats.err += st.err
@@ -302,12 +476,14 @@ async def run_one(
     duration = t1 - t0
     total_ops = (n_buyers + n_sellers) * ops_per_client
     throughput = (total_ops / duration) if duration > 0 else 0.0
-
-    # avg response time for this run = mean across all calls in this run
     avg_resp = all_stats.avg
 
     return avg_resp, throughput, all_stats
 
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -320,7 +496,6 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=1, help="number of warmup runs (not counted)")
     args = ap.parse_args()
 
-    # scenario mapping
     if args.scenario == 1:
         n_sellers, n_buyers = 1, 1
     elif args.scenario == 2:
@@ -330,54 +505,51 @@ def main() -> None:
 
     cfg = load_config(args.config)
 
-    async def run_all():
-        for w in range(args.warmup):
-            await run_one(
-                cfg.frontend_buyer.host,
-                cfg.frontend_buyer.port,
-                cfg.frontend_seller.host,
-                cfg.frontend_seller.port,
-                n_buyers=n_buyers,
-                n_sellers=n_sellers,
-                ops_per_client=min(200, args.ops_per_client),
-                items_per_seller=max(1, min(2, args.items_per_seller)),
-                seed=args.seed + 9999 + w,
-                run_idx=-(w + 1),
-            )
+    buyer_base_url = f"http://{cfg.frontend_buyer.host}:{cfg.frontend_buyer.port}"
+    seller_base_url = f"http://{cfg.frontend_seller.host}:{cfg.frontend_seller.port}"
 
-        run_avgs: List[float] = []
-        run_throughputs: List[float] = []
+    # Warmup runs (not counted in results)
+    for w in range(args.warmup):
+        run_one(
+            buyer_base_url,
+            seller_base_url,
+            n_buyers=n_buyers,
+            n_sellers=n_sellers,
+            ops_per_client=min(200, args.ops_per_client),
+            items_per_seller=max(1, min(2, args.items_per_seller)),
+            seed=args.seed + 9999 + w,
+            run_idx=-(w + 1),
+        )
 
-        for r in range(args.runs):
-            avg_resp, throughput, st = await run_one(
-                cfg.frontend_buyer.host,
-                cfg.frontend_buyer.port,
-                cfg.frontend_seller.host,
-                cfg.frontend_seller.port,
-                n_buyers=n_buyers,
-                n_sellers=n_sellers,
-                ops_per_client=args.ops_per_client,
-                items_per_seller=args.items_per_seller,
-                seed=args.seed + r * 17,
-                run_idx=r,
-            )
-            run_avgs.append(avg_resp)
-            run_throughputs.append(throughput)
-            print(
-                f"run {r+1}/{args.runs}: avg_resp={avg_resp:.6f}s "
-                f"p50={st.p50:.6f}s p95={st.p95:.6f}s "
-                f"throughput={throughput:.2f} ops/s"
-            )
+    run_avgs: List[float] = []
+    run_throughputs: List[float] = []
 
-        avg_of_avgs = statistics.fmean(run_avgs) if run_avgs else 0.0
-        avg_throughput = statistics.fmean(run_throughputs) if run_throughputs else 0.0
+    for r in range(args.runs):
+        avg_resp, throughput, st = run_one(
+            buyer_base_url,
+            seller_base_url,
+            n_buyers=n_buyers,
+            n_sellers=n_sellers,
+            ops_per_client=args.ops_per_client,
+            items_per_seller=args.items_per_seller,
+            seed=args.seed + r * 17,
+            run_idx=r,
+        )
+        run_avgs.append(avg_resp)
+        run_throughputs.append(throughput)
+        print(
+            f"run {r+1}/{args.runs}: avg_resp={avg_resp:.6f}s "
+            f"p50={st.p50:.6f}s p95={st.p95:.6f}s "
+            f"throughput={throughput:.2f} ops/s"
+        )
 
-        print("\n=== A1 Report Numbers ===")
-        print(f"scenario={args.scenario} sellers={n_sellers} buyers={n_buyers}")
-        print(f"average_response_time_over_{args.runs}_runs={avg_of_avgs:.6f}s")
-        print(f"average_throughput_over_{args.runs}_runs={avg_throughput:.2f} ops/s")
+    avg_of_avgs = statistics.fmean(run_avgs) if run_avgs else 0.0
+    avg_throughput = statistics.fmean(run_throughputs) if run_throughputs else 0.0
 
-    asyncio.run(run_all())
+    print("\n=== A2 Report Numbers ===")
+    print(f"scenario={args.scenario} sellers={n_sellers} buyers={n_buyers}")
+    print(f"average_response_time_over_{args.runs}_runs={avg_of_avgs:.6f}s")
+    print(f"average_throughput_over_{args.runs}_runs={avg_throughput:.2f} ops/s")
 
 
 if __name__ == "__main__":
