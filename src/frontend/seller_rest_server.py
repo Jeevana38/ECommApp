@@ -6,6 +6,14 @@ import os
 from src.proto import customer_pb2, customer_pb2_grpc
 from src.proto import product_pb2, product_pb2_grpc
 
+import argparse
+from src.common.config import load_config
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
+args = parser.parse_args()
+
+cfg = load_config(args.config)
 app = FastAPI()
 
 # -------------------------------------------------
@@ -14,10 +22,10 @@ app = FastAPI()
 # Product ops        → Product DB port 50052
 # -------------------------------------------------
 
-CUSTOMER_HOST        = os.getenv("CUSTOMER_HOST",        "localhost")
-PRODUCT_HOST         = os.getenv("PRODUCT_HOST",         "localhost")
-CUSTOMER_SELLER_PORT = int(os.getenv("CUSTOMER_SELLER_PORT", "50053"))
-PRODUCT_PORT         = int(os.getenv("PRODUCT_PORT",         "50052"))
+CUSTOMER_HOST        = cfg.backend_customer_db.host
+PRODUCT_HOST         = cfg.backend_product_db.host
+CUSTOMER_SELLER_PORT = cfg.backend_customer_db.seller_port
+PRODUCT_PORT         = cfg.backend_product_db.port
 
 customer_channel = grpc.insecure_channel(f"{CUSTOMER_HOST}:{CUSTOMER_SELLER_PORT}")
 product_channel  = grpc.insecure_channel(f"{PRODUCT_HOST}:{PRODUCT_PORT}")

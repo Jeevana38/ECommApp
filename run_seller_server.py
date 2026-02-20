@@ -17,11 +17,17 @@ import os
 import uvicorn
 
 from src.frontend.seller_rest_server import app
+from src.common.config import load_config
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
+args = parser.parse_args()
 
+cfg = load_config(args.config)
 if __name__ == "__main__":
-    host = os.getenv("SELLER_HOST", "0.0.0.0")
-    port = int(os.getenv("SELLER_PORT", "8001"))
+    host = cfg.frontend_seller.host
+    port = cfg.frontend_seller.port
     print(f"Starting Seller REST server on {host}:{port}")
-    print(f"  Customer DB : {os.getenv('CUSTOMER_HOST', 'localhost')}:{os.getenv('CUSTOMER_SELLER_PORT', '50053')}")
-    print(f"  Product DB  : {os.getenv('PRODUCT_HOST',  'localhost')}:{os.getenv('PRODUCT_PORT', '50052')}")
+    print(f"  Customer DB : {cfg.backend_customer_db.host}:{cfg.backend_customer_db.seller_port}")
+    print(f"  Product DB  : {cfg.backend_product_db.host}:{cfg.backend_product_db.port}")
     uvicorn.run(app, host=host, port=port)
