@@ -7,6 +7,14 @@ from src.proto import customer_pb2, customer_pb2_grpc
 from src.proto import product_pb2, product_pb2_grpc
 from src.financial.soap_client import SOAPClient
 
+import argparse
+from src.common.config import load_config
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
+args = parser.parse_args()
+
+cfg = load_config(args.config)
 app = FastAPI()
 
 # -------------------------------------------------
@@ -15,12 +23,12 @@ app = FastAPI()
 # Product ops       → Product DB port 50052
 # -------------------------------------------------
 
-CUSTOMER_HOST       = os.getenv("CUSTOMER_HOST",       "localhost")
-PRODUCT_HOST        = os.getenv("PRODUCT_HOST",        "localhost")
-SOAP_HOST           = os.getenv("SOAP_HOST",           "localhost")
-CUSTOMER_BUYER_PORT = int(os.getenv("CUSTOMER_BUYER_PORT", "50051"))
-PRODUCT_PORT        = int(os.getenv("PRODUCT_PORT",        "50052"))
-SOAP_PORT           = int(os.getenv("SOAP_PORT",           "8000"))
+CUSTOMER_HOST       = cfg.backend_customer_db.host
+PRODUCT_HOST        = cfg.backend_product_db.host
+SOAP_HOST           = cfg.soap.host
+CUSTOMER_BUYER_PORT = cfg.backend_customer_db.port
+PRODUCT_PORT        = cfg.backend_product_db.port
+SOAP_PORT           = cfg.soap.port
 
 customer_channel = grpc.insecure_channel(f"{CUSTOMER_HOST}:{CUSTOMER_BUYER_PORT}")
 product_channel  = grpc.insecure_channel(f"{PRODUCT_HOST}:{PRODUCT_PORT}")

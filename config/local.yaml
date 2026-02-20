@@ -1,20 +1,32 @@
 frontend_seller:
-  host: "127.0.0.1"   # VM1
+  host: "127.0.0.1"   # VM4 - run_seller_server
   port: 8080
 
 frontend_buyer:
-  host: "127.0.0.1"      #VM2
+  host: "127.0.0.1"      #VM5 - run_buyer_server
   port: 8090
 
-customer_db:
-  host:  "127.0.0.1"        # VM3
+backend_customer_db:
+  host:  "127.0.0.1"        # customer_grpc_server VM1
   port: 50051           
   seller_port: 50053    
 
 backend_product_db:
-  host: "127.0.0.1"          # VM4
+  host: "127.0.0.1"          # product_grpc_server VM2
   port: 50052
 
 soap:
-  host: "127.0.0.1"       #can be on any VM     
+  host: "127.0.0.1"       #financial soap server - VM3 - can be any VM , example : it can be a new VM or VM1..4 
   port: 8000
+
+session:
+  timeout_seconds: 300
+
+features:
+  enable_make_purchase: true
+
+storage:
+  data_dir: "./data"
+
+logging:
+  level: "INFO"

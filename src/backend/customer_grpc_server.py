@@ -16,6 +16,14 @@ from src.proto import customer_pb2, customer_pb2_grpc
 from src.server.state import MarketState
 from src.server.handlers import buyer, seller
 
+import argparse
+from src.common.config import load_config
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
+args = parser.parse_args()
+
+cfg = load_config(args.config)
 # One shared state for this entire process
 _SHARED_STATE = MarketState()
 
@@ -179,8 +187,8 @@ class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
 
 
 def serve():
-    buyer_port  = int(os.getenv("CUSTOMER_BUYER_PORT",  "50051"))
-    seller_port = int(os.getenv("CUSTOMER_SELLER_PORT", "50053"))
+    buyer_port = cfg.backend_customer_db.port
+    seller_port = cfg.backend_customer_db.seller_port
 
     buyer_server = grpc.server(futures.ThreadPoolExecutor(max_workers=20))
     customer_pb2_grpc.add_CustomerServiceServicer_to_server(

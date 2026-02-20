@@ -19,12 +19,20 @@ import os
 import uvicorn
 
 from src.frontend.buyer_rest_server import app
+import argparse
+from src.common.config import load_config
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
+args = parser.parse_args()
+
+cfg = load_config(args.config)
 
 if __name__ == "__main__":
-    host = os.getenv("BUYER_HOST", "0.0.0.0")
-    port = int(os.getenv("BUYER_PORT", "8002"))
+    host = cfg.frontend_buyer.host
+    port = cfg.frontend_buyer.port
     print(f"Starting Buyer REST server on {host}:{port}")
-    print(f"  Customer DB : {os.getenv('CUSTOMER_HOST', 'localhost')}:{os.getenv('CUSTOMER_BUYER_PORT', '50051')}")
-    print(f"  Product DB  : {os.getenv('PRODUCT_HOST',  'localhost')}:{os.getenv('PRODUCT_PORT', '50052')}")
-    print(f"  SOAP        : {os.getenv('SOAP_HOST', 'localhost')}:{os.getenv('SOAP_PORT', '8000')}")
+    print(f"  Customer DB : {cfg.backend_customer_db.host}:{cfg.backend_customer_db.port}")
+    print(f"  Product DB  : {cfg.backend_product_db.host}:{cfg.backend_product_db.port}")
+    print(f"  SOAP        : {cfg.soap.host}:{cfg.soap.port}")
     uvicorn.run(app, host=host, port=port)
