@@ -72,7 +72,7 @@ This generates:
 |-----|------------------------|
 | VM1 | Customer gRPC Backend  |
 | VM2 | Product gRPC Backend   |
-| VM3 | SOAP Financial Service |
+| VM3 or any used VM | SOAP Financial Service |
 | VM4 | Seller REST Frontend   |
 | VM5 | Buyer REST Frontend    |
 
@@ -102,7 +102,7 @@ python3 -m src.backend.product_grpc_server --config config/local.yaml
 
 ---
 
-##  3️⃣ VM3 – SOAP Financial Service
+##  3️⃣ VM3 – SOAP Financial Service (Can be VM1/VM2/VM4/VM5)
 
 ```bash
 python3 -m src.financial.soap_server --config config/local.yaml
