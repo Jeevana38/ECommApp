@@ -50,3 +50,19 @@ python run_buyer_server.py --config config/local.yaml --replica-id 3
 5. Start all **Seller frontend replicas**
 6. Start all **Buyer frontend replicas**
 7. Run CLI or benchmarks from any machine that can reach the frontend replica IPs
+
+In another terminal, run the benchmark:
+```bash
+python -m src.clients.bench.runner --config config/local.yaml --scenario 1 --failure-mode normal
+```
+
+Run the other benchmark modes the same way:
+```bash
+python -m src.clients.bench.runner --config config/local.yaml --scenario 1 --failure-mode frontend_fail
+python -m src.clients.bench.runner --config config/local.yaml --scenario 1 --failure-mode product_follower_fail
+python -m src.clients.bench.runner --config config/local.yaml --scenario 1 --failure-mode product_leader_fail
+```
+
+Repeat for:
+--scenario 2
+--scenario 3
