@@ -32,32 +32,43 @@ _SHARED_STATE = MarketState()
 _CUSTOMER_GROUP: RotatingSequencerGroup | None = None
 
 
+def _debug(message: str) -> None:
+    print(f"[customer-replica {args.replica_id}] {message}", flush=True)
+
+
 def _apply_customer_operation(payload: dict) -> dict:
     role = str(payload.get("role") or "")
     action = str(payload.get("action") or "")
     data = dict(payload.get("data") or {})
+    _debug(f"apply action={action} role={role}")
 
     if role == "buyer":
-        return asyncio.run(buyer.handle(_SHARED_STATE, {
+        result = asyncio.run(buyer.handle(_SHARED_STATE, {
             "req_id": f"atomic_{action}",
             "action": action,
             "data": data,
         }))
+        _debug(f"apply result action={action} role={role} ok={result.get('ok')}")
+        return result
 
     if role == "seller":
-        return asyncio.run(seller.handle(_SHARED_STATE, {
+        result = asyncio.run(seller.handle(_SHARED_STATE, {
             "req_id": f"atomic_{action}",
             "action": action,
             "data": data,
         }))
+        _debug(f"apply result action={action} role={role} ok={result.get('ok')}")
+        return result
 
     if role == "system" and action == "RecordPurchase":
         sess = asyncio.run(_SHARED_STATE.get_session(data.get("session_token", "")))
         if not sess or sess.role != "buyer":
+            _debug("RecordPurchase rejected because session was missing")
             raise ValueError("invalid session")
         asyncio.run(_SHARED_STATE.db.inc_buyer_items_purchased(
             int(sess.principal_id), int(data.get("total_units", 0))
         ))
+        _debug("RecordPurchase applied successfully")
         return {"ok": True, "data": {"recorded": True}}
 
     raise ValueError(f"unsupported customer mutation: role={role} action={action}")
@@ -65,7 +76,9 @@ def _apply_customer_operation(payload: dict) -> dict:
 
 def _broadcast_customer_mutation(payload: dict) -> dict:
     if _CUSTOMER_GROUP is None:
+        _debug(f"local mutation action={payload.get('action')} role={payload.get('role')}")
         return _apply_customer_operation(payload)
+    _debug(f"broadcast mutation action={payload.get('action')} role={payload.get('role')}")
     return _CUSTOMER_GROUP.submit(payload)
 
 
@@ -79,6 +92,7 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
         return asyncio.run(handler(self.state, req_dict))
 
     def CreateAccount(self, request, context):
+        _debug(f"CreateAccount request username={request.username!r} role=buyer")
         resp = _broadcast_customer_mutation({
             "role": "buyer",
             "action": "CreateAccount",
@@ -89,6 +103,7 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
         return customer_pb2.CreateAccountResponse(user_id=resp["data"]["buyer_id"])
 
     def Login(self, request, context):
+        _debug(f"Login request username={request.username!r} role=buyer")
         resp = _broadcast_customer_mutation({
             "role": "buyer",
             "action": "Login",
@@ -99,13 +114,16 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
             },
         })
         if not resp.get("ok"):
+            _debug(f"Login failed role=buyer error={resp.get('error', 'invalid credentials')}")
             context.abort(grpc.StatusCode.UNAUTHENTICATED, resp.get("error", "invalid credentials"))
+        _debug(f"Login ok role=buyer token={resp['data']['session_token']}")
         return customer_pb2.LoginResponse(
             session_token=resp["data"]["session_token"],
             user_id=resp["data"]["buyer_id"]
         )
 
     def Logout(self, request, context):
+        _debug(f"Logout request role=buyer token={request.session_token}")
         _broadcast_customer_mutation({
             "role": "buyer",
             "action": "Logout",
@@ -121,7 +139,9 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
         """
         sess = asyncio.run(self.state.get_session(request.session_token))
         if not sess:
+            _debug(f"ValidateSession miss token={request.session_token}")
             return customer_pb2.SessionInfo(valid=False, principal_id=0, role="")
+        _debug(f"ValidateSession hit token={request.session_token} principal={sess.principal_id} role={sess.role}")
         return customer_pb2.SessionInfo(
             valid=True,
             principal_id=int(sess.principal_id),
@@ -157,6 +177,7 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
 
     def RecordPurchase(self, request, context):
         try:
+            _debug(f"RecordPurchase request token={request.session_token} total_units={request.total_units}")
             _broadcast_customer_mutation({
                 "role": "system",
                 "action": "RecordPurchase",
@@ -166,6 +187,7 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
                 },
             })
         except Exception as exc:
+            _debug(f"RecordPurchase failed error={exc}")
             context.abort(grpc.StatusCode.UNAUTHENTICATED, str(exc))
         return customer_pb2.Empty()
 
@@ -180,6 +202,7 @@ class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
         return asyncio.run(handler(self.state, req_dict))
 
     def CreateAccount(self, request, context):
+        _debug(f"CreateAccount request username={request.username!r} role=seller")
         resp = _broadcast_customer_mutation({
             "role": "seller",
             "action": "CreateAccount",
@@ -190,6 +213,7 @@ class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
         return customer_pb2.CreateAccountResponse(user_id=resp["data"]["seller_id"])
 
     def Login(self, request, context):
+        _debug(f"Login request username={request.username!r} role=seller")
         resp = _broadcast_customer_mutation({
             "role": "seller",
             "action": "Login",
@@ -200,13 +224,16 @@ class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
             },
         })
         if not resp.get("ok"):
+            _debug(f"Login failed role=seller error={resp.get('error', 'invalid credentials')}")
             context.abort(grpc.StatusCode.UNAUTHENTICATED, resp.get("error", "invalid credentials"))
+        _debug(f"Login ok role=seller token={resp['data']['session_token']}")
         return customer_pb2.LoginResponse(
             session_token=resp["data"]["session_token"],
             user_id=resp["data"]["seller_id"]
         )
 
     def Logout(self, request, context):
+        _debug(f"Logout request role=seller token={request.session_token}")
         _broadcast_customer_mutation({
             "role": "seller",
             "action": "Logout",
@@ -218,7 +245,9 @@ class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
         """Same session store — sellers and buyers share the same DB."""
         sess = asyncio.run(self.state.get_session(request.session_token))
         if not sess:
+            _debug(f"ValidateSession miss token={request.session_token}")
             return customer_pb2.SessionInfo(valid=False, principal_id=0, role="")
+        _debug(f"ValidateSession hit token={request.session_token} principal={sess.principal_id} role={sess.role}")
         return customer_pb2.SessionInfo(
             valid=True,
             principal_id=int(sess.principal_id),
