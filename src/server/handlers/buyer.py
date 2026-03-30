@@ -46,7 +46,7 @@ def _score_item_keywords(item_keywords: List[str], query_keywords: List[str]) ->
     return sum(1 for q in query_keywords if q.lower() in item_set)
 
 
-async def _do_purchase(state: MarketState, buyer_id: int) -> Dict[str, Any]:
+async def _do_purchase(state: MarketState, buyer_id: int, txn_id: str | None = None) -> Dict[str, Any]:
     """
     Implements purchase semantics.
     Cart is now read/written via state.get_cart / state.set_cart
@@ -101,7 +101,7 @@ async def _do_purchase(state: MarketState, buyer_id: int) -> Dict[str, Any]:
     await state.db.inc_buyer_items_purchased(int(buyer_id), int(total_units))
 
     txn = Transaction(
-        txn_id=new_id("txn"),
+        txn_id=str(txn_id or new_id("txn")),
         buyer_id=int(buyer_id),
         items=lines,
         total=total,
@@ -138,7 +138,7 @@ async def handle(state: MarketState, req: Dict[str, Any]) -> Dict[str, Any]:
                 b = await state.db.get_buyer(buyer_id)
                 if not b or b.password_hash != hash_password(password):
                     return err(req_id, "invalid credentials")
-                token = await state.create_session("buyer", buyer_id)
+                token = await state.create_session("buyer", buyer_id, token=data.get("session_token"))
                 # No in-memory cart load needed — cart lives in DB now
                 return ok(req_id, {"buyer_id": int(b.buyer_id), "buyer_name": b.name, "session_token": token})
 
@@ -153,7 +153,7 @@ async def handle(state: MarketState, req: Dict[str, Any]) -> Dict[str, Any]:
             b = matches[0]
             if b.password_hash != hash_password(password):
                 return err(req_id, "invalid credentials")
-            token = await state.create_session("buyer", int(b.buyer_id))
+            token = await state.create_session("buyer", int(b.buyer_id), token=data.get("session_token"))
             return ok(req_id, {"buyer_id": int(b.buyer_id), "buyer_name": b.name, "session_token": token})
 
         # ------------------------------
@@ -284,7 +284,7 @@ async def handle(state: MarketState, req: Dict[str, Any]) -> Dict[str, Any]:
         # MakePurchase
         # ------------------------------
         if action in {"make_purchase", "MakePurchase", "checkout"}:
-            out = await _do_purchase(state, int(buyer_id))
+            out = await _do_purchase(state, int(buyer_id), txn_id=data.get("txn_id"))
             return ok(req_id, out)
 
         # ------------------------------

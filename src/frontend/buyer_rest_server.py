@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import grpc
-import os
 
 from src.proto import customer_pb2, customer_pb2_grpc
 from src.proto import product_pb2, product_pb2_grpc
@@ -23,20 +22,34 @@ app = FastAPI()
 # Product ops       → Product DB port 50052
 # -------------------------------------------------
 
-CUSTOMER_HOST       = cfg.backend_customer_db.host
-PRODUCT_HOST        = cfg.backend_product_db.host
 SOAP_HOST           = cfg.soap.host
-CUSTOMER_BUYER_PORT = cfg.backend_customer_db.port
-PRODUCT_PORT        = cfg.backend_product_db.port
 SOAP_PORT           = cfg.soap.port
 
-customer_channel = grpc.insecure_channel(f"{CUSTOMER_HOST}:{CUSTOMER_BUYER_PORT}")
-product_channel  = grpc.insecure_channel(f"{PRODUCT_HOST}:{PRODUCT_PORT}")
+customer_channels = [
+    grpc.insecure_channel(f"{replica.host}:{replica.port}")
+    for replica in cfg.backend_customer_db.buyer_targets()
+]
+product_channels = [
+    grpc.insecure_channel(f"{replica.host}:{replica.port}")
+    for replica in cfg.backend_product_db.targets()
+]
 
-customer_stub = customer_pb2_grpc.CustomerServiceStub(customer_channel)
-product_stub  = product_pb2_grpc.ProductServiceStub(product_channel)
+customer_stubs = [customer_pb2_grpc.CustomerServiceStub(channel) for channel in customer_channels]
+product_stubs = [product_pb2_grpc.ProductServiceStub(channel) for channel in product_channels]
 
 soap_client = SOAPClient(f"http://{SOAP_HOST}:{SOAP_PORT}/?wsdl")
+
+
+def _call_any(stubs, method_name: str, request):
+    last_error = None
+    for stub in stubs:
+        try:
+            return getattr(stub, method_name)(request)
+        except grpc.RpcError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("no backend stubs configured")
 
 # -------------------------------------------------
 # Request Models
@@ -85,7 +98,7 @@ class PurchaseRequest(BaseModel):
 @app.post("/buyer/create_account")
 def create_account(req: AccountRequest):
     try:
-        response = customer_stub.CreateAccount(
+        response = _call_any(customer_stubs, "CreateAccount",
             customer_pb2.CreateAccountRequest(
                 username=req.username, password=req.password
             )
@@ -98,7 +111,7 @@ def create_account(req: AccountRequest):
 @app.post("/buyer/login")
 def login(req: AccountRequest):
     try:
-        response = customer_stub.Login(
+        response = _call_any(customer_stubs, "Login",
             customer_pb2.LoginRequest(
                 username=req.username, password=req.password
             )
@@ -111,7 +124,7 @@ def login(req: AccountRequest):
 @app.post("/buyer/logout")
 def logout(req: SessionRequest):
     try:
-        customer_stub.Logout(
+        _call_any(customer_stubs, "Logout",
             customer_pb2.SessionRequest(session_token=req.session_token)
         )
         return {"status": "logged_out"}
@@ -126,7 +139,7 @@ def logout(req: SessionRequest):
 @app.post("/buyer/search")
 def search_items(req: SearchRequestModel):
     try:
-        response = product_stub.SearchItems(
+        response = _call_any(product_stubs, "SearchItems",
             product_pb2.SearchRequest(
                 category=req.item_category,
                 session_token=req.session_token
@@ -146,7 +159,7 @@ def search_items(req: SearchRequestModel):
 @app.post("/buyer/get_item")
 def get_item(req: ItemRequestModel):
     try:
-        item = product_stub.GetItem(
+        item = _call_any(product_stubs, "GetItem",
             product_pb2.ItemRequest(
                 item_id=req.item_id, session_token=req.session_token
             )
@@ -164,7 +177,7 @@ def get_item(req: ItemRequestModel):
 @app.post("/buyer/add_to_cart")
 def add_to_cart(req: CartRequestModel):
     try:
-        product_stub.AddToCart(
+        _call_any(product_stubs, "AddToCart",
             product_pb2.CartRequest(
                 item_id=req.item_id, quantity=req.quantity,
                 session_token=req.session_token
@@ -178,7 +191,7 @@ def add_to_cart(req: CartRequestModel):
 @app.post("/buyer/remove_from_cart")
 def remove_from_cart(req: CartRequestModel):
     try:
-        product_stub.RemoveFromCart(
+        _call_any(product_stubs, "RemoveFromCart",
             product_pb2.CartRequest(
                 item_id=req.item_id, quantity=req.quantity,
                 session_token=req.session_token
@@ -192,7 +205,7 @@ def remove_from_cart(req: CartRequestModel):
 @app.post("/buyer/save_cart")
 def save_cart(req: SessionRequest):
     try:
-        product_stub.SaveCart(
+        _call_any(product_stubs, "SaveCart",
             product_pb2.SessionRequest(session_token=req.session_token)
         )
         return {"status": "cart_saved"}
@@ -203,7 +216,7 @@ def save_cart(req: SessionRequest):
 @app.post("/buyer/clear_cart")
 def clear_cart(req: SessionRequest):
     try:
-        product_stub.ClearCart(
+        _call_any(product_stubs, "ClearCart",
             product_pb2.SessionRequest(session_token=req.session_token)
         )
         return {"status": "cart_cleared"}
@@ -214,7 +227,7 @@ def clear_cart(req: SessionRequest):
 @app.post("/buyer/display_cart")
 def get_cart(req: SessionRequest):
     try:
-        response = product_stub.GetCart(
+        response = _call_any(product_stubs, "GetCart",
             product_pb2.SessionRequest(session_token=req.session_token)
         )
         return {
@@ -234,7 +247,7 @@ def get_cart(req: SessionRequest):
 @app.post("/buyer/provide_feedback")
 def provide_feedback(req: FeedbackRequestModel):
     try:
-        product_stub.ProvideFeedback(
+        _call_any(product_stubs, "ProvideFeedback",
             product_pb2.FeedbackRequest(
                 item_id=req.item_id, feedback=req.feedback,
                 session_token=req.session_token
@@ -248,7 +261,7 @@ def provide_feedback(req: FeedbackRequestModel):
 @app.post("/buyer/get_seller_rating")
 def get_seller_rating(req: SellerRatingRequest):
     try:
-        response = customer_stub.GetSellerRating(
+        response = _call_any(customer_stubs, "GetSellerRating",
             customer_pb2.SessionSellerRequest(
                 seller_id=req.seller_id,
                 session_token=req.session_token
@@ -266,7 +279,7 @@ def get_seller_rating(req: SellerRatingRequest):
 @app.post("/buyer/get_purchases")
 def get_purchases(req: SessionRequest):
     try:
-        response = customer_stub.GetBuyerPurchases(
+        response = _call_any(customer_stubs, "GetBuyerPurchases",
             customer_pb2.SessionRequest(session_token=req.session_token)
         )
         return {"item_ids": list(response.item_ids)}
@@ -294,7 +307,7 @@ def make_purchase(req: PurchaseRequest):
 
     #  Finalize purchase on Product DB
     try:
-        purchase_result = product_stub.FinalizePurchase(
+        purchase_result = _call_any(product_stubs, "FinalizePurchase",
             product_pb2.SessionRequest(session_token=req.session_token)
         )
     except grpc.RpcError as e:

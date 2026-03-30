@@ -45,9 +45,9 @@ class InMemoryDB:
     # Session Management (PA2)
     # ------------------------------
 
-    async def create_session(self, role: str, principal_id: int) -> str:
+    async def create_session(self, role: str, principal_id: int, token: str | None = None) -> str:
         """Create a new session and return the token."""
-        token = uuid.uuid4().hex
+        token = str(token or uuid.uuid4().hex)
         async with self._sessions_lock:
             self._sessions[token] = {
                 "principal_id": int(principal_id),

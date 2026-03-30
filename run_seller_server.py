@@ -21,13 +21,16 @@ from src.common.config import load_config
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
+parser.add_argument("--replica-id", type=int, default=0)
 args = parser.parse_args()
 
 cfg = load_config(args.config)
 if __name__ == "__main__":
-    host = cfg.frontend_seller.host
-    port = cfg.frontend_seller.port
+    replicas = cfg.frontend_seller.targets()
+    target = replicas[max(0, min(args.replica_id, len(replicas) - 1))]
+    host = target.host
+    port = target.port
     print(f"Starting Seller REST server on {host}:{port}")
-    print(f"  Customer DB : {cfg.backend_customer_db.host}:{cfg.backend_customer_db.seller_port}")
-    print(f"  Product DB  : {cfg.backend_product_db.host}:{cfg.backend_product_db.port}")
+    print(f"  Customer DB replicas: {[r.address for r in cfg.backend_customer_db.seller_targets()]}")
+    print(f"  Product DB replicas : {[r.address for r in cfg.backend_product_db.targets()]}")
     uvicorn.run(app, host=host, port=port)

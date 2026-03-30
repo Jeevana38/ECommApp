@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import grpc
-import os
 
 from src.proto import customer_pb2, customer_pb2_grpc
 from src.proto import product_pb2, product_pb2_grpc
@@ -22,16 +21,29 @@ app = FastAPI()
 # Product ops        → Product DB port 50052
 # -------------------------------------------------
 
-CUSTOMER_HOST        = cfg.backend_customer_db.host
-PRODUCT_HOST         = cfg.backend_product_db.host
-CUSTOMER_SELLER_PORT = cfg.backend_customer_db.seller_port
-PRODUCT_PORT         = cfg.backend_product_db.port
+customer_channels = [
+    grpc.insecure_channel(f"{replica.host}:{replica.port}")
+    for replica in cfg.backend_customer_db.seller_targets()
+]
+product_channels = [
+    grpc.insecure_channel(f"{replica.host}:{replica.port}")
+    for replica in cfg.backend_product_db.targets()
+]
 
-customer_channel = grpc.insecure_channel(f"{CUSTOMER_HOST}:{CUSTOMER_SELLER_PORT}")
-product_channel  = grpc.insecure_channel(f"{PRODUCT_HOST}:{PRODUCT_PORT}")
+customer_stubs = [customer_pb2_grpc.CustomerServiceStub(channel) for channel in customer_channels]
+product_stubs = [product_pb2_grpc.ProductServiceStub(channel) for channel in product_channels]
 
-customer_stub = customer_pb2_grpc.CustomerServiceStub(customer_channel)
-product_stub  = product_pb2_grpc.ProductServiceStub(product_channel)
+
+def _call_any(stubs, method_name: str, request):
+    last_error = None
+    for stub in stubs:
+        try:
+            return getattr(stub, method_name)(request)
+        except grpc.RpcError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("no backend stubs configured")
 
 # -------------------------------------------------
 # Request Models
@@ -72,7 +84,7 @@ class SellerRatingRequest(BaseModel):
 @app.post("/seller/create_account")
 def create_account(req: AccountRequest):
     try:
-        response = customer_stub.CreateAccount(
+        response = _call_any(customer_stubs, "CreateAccount",
             customer_pb2.CreateAccountRequest(
                 username=req.username, password=req.password
             )
@@ -85,7 +97,7 @@ def create_account(req: AccountRequest):
 @app.post("/seller/login")
 def login(req: AccountRequest):
     try:
-        response = customer_stub.Login(
+        response = _call_any(customer_stubs, "Login",
             customer_pb2.LoginRequest(
                 username=req.username, password=req.password
             )
@@ -98,7 +110,7 @@ def login(req: AccountRequest):
 @app.post("/seller/logout")
 def logout(req: SessionRequest):
     try:
-        customer_stub.Logout(
+        _call_any(customer_stubs, "Logout",
             customer_pb2.SessionRequest(session_token=req.session_token)
         )
         return {"status": "logged_out"}
@@ -113,7 +125,7 @@ def logout(req: SessionRequest):
 @app.post("/seller/register_item")
 def register_item(req: RegisterItemRequestModel):
     try:
-        response = product_stub.RegisterItem(
+        response = _call_any(product_stubs, "RegisterItem",
             product_pb2.RegisterItemRequest(
                 name=req.name, category=req.category,
                 price=req.price, quantity=req.quantity,
@@ -128,7 +140,7 @@ def register_item(req: RegisterItemRequestModel):
 @app.post("/seller/change_price")
 def change_price(req: ChangePriceRequestModel):
     try:
-        product_stub.ChangePrice(
+        _call_any(product_stubs, "ChangePrice",
             product_pb2.ChangePriceRequest(
                 item_id=req.item_id, new_price=req.new_price,
                 session_token=req.session_token
@@ -142,7 +154,7 @@ def change_price(req: ChangePriceRequestModel):
 @app.post("/seller/update_quantity")
 def update_quantity(req: UpdateQuantityRequestModel):
     try:
-        product_stub.UpdateQuantity(
+        _call_any(product_stubs, "UpdateQuantity",
             product_pb2.UpdateQuantityRequest(
                 item_id=req.item_id, quantity=req.quantity,
                 session_token=req.session_token
@@ -156,7 +168,7 @@ def update_quantity(req: UpdateQuantityRequestModel):
 @app.post("/seller/display_items")
 def display_items(req: SessionRequest):
     try:
-        response = product_stub.DisplayItemsForSale(
+        response = _call_any(product_stubs, "DisplayItemsForSale",
             product_pb2.SessionRequest(session_token=req.session_token)
         )
         return {
@@ -173,7 +185,7 @@ def display_items(req: SessionRequest):
 @app.post("/seller/get_rating")
 def get_rating(req: SellerRatingRequest):
     try:
-        response = customer_stub.GetSellerRating(
+        response = _call_any(customer_stubs, "GetSellerRating",
             customer_pb2.SessionSellerRequest(
                 session_token=req.session_token,
                 seller_id=req.seller_id

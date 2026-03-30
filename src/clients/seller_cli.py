@@ -146,9 +146,12 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    base_url = f"http://{cfg.frontend_seller.host}:{cfg.frontend_seller.port}"
+    base_urls = [
+        f"http://{replica.host}:{replica.port}"
+        for replica in cfg.frontend_seller.targets()
+    ]
 
-    client = MarketplaceClient(base_url)
+    client = MarketplaceClient(base_urls)
     repl(client)
 
 

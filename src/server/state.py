@@ -26,12 +26,12 @@ class MarketState:
     # Session Management — delegates entirely to DB
     # ------------------------------------------------------------------
 
-    async def create_session(self, role: str, principal_id: int) -> str:
+    async def create_session(self, role: str, principal_id: int, token: str | None = None) -> str:
         """
         Create a new session in the DB and return the token.
         No in-memory state is touched.
         """
-        token = await self.db.create_session(role=role, principal_id=int(principal_id))
+        token = await self.db.create_session(role=role, principal_id=int(principal_id), token=token)
         return token
 
     async def get_session(self, token: str) -> Optional[Session]:

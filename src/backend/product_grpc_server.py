@@ -8,6 +8,11 @@ Calls Customer DB (ValidateSession) over gRPC to verify tokens.
 
 import asyncio
 import grpc
+import json
+import os
+import uuid
+import threading
+import time
 from concurrent import futures
 
 from src.proto import product_pb2, product_pb2_grpc
@@ -15,39 +20,44 @@ from src.proto import customer_pb2, customer_pb2_grpc
 from src.server.state import MarketState
 from src.server.handlers import buyer, seller
 from src.common.models import Seller, Buyer
+from src.replication.simple_raft import NotLeaderError, SimpleRaftNode
 
 import argparse
 from src.common.config import load_config
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
+parser.add_argument("--replica-id", type=int, default=0)
 args = parser.parse_args()
 
 cfg = load_config(args.config)
 
 _SHARED_STATE = MarketState()
 
-CUSTOMER_HOST        = cfg.backend_customer_db.host
-CUSTOMER_BUYER_PORT  = cfg.backend_customer_db.port
-CUSTOMER_SELLER_PORT = cfg.backend_customer_db.seller_port
-
-_buyer_channel        = grpc.insecure_channel(f"{CUSTOMER_HOST}:{CUSTOMER_BUYER_PORT}")
-_seller_channel       = grpc.insecure_channel(f"{CUSTOMER_HOST}:{CUSTOMER_SELLER_PORT}")
-_buyer_customer_stub  = customer_pb2_grpc.CustomerServiceStub(_buyer_channel)
-_seller_customer_stub = customer_pb2_grpc.CustomerServiceStub(_seller_channel)
+_buyer_customer_stubs = [
+    customer_pb2_grpc.CustomerServiceStub(grpc.insecure_channel(f"{replica.host}:{replica.port}"))
+    for replica in cfg.backend_customer_db.buyer_targets()
+]
+_seller_customer_stubs = [
+    customer_pb2_grpc.CustomerServiceStub(grpc.insecure_channel(f"{replica.host}:{replica.port}"))
+    for replica in cfg.backend_customer_db.seller_targets()
+]
+_RAFT_NODE: SimpleRaftNode | None = None
 
 
 def validate_session(session_token: str, expected_role: str) -> tuple[bool, int]:
-    try:
-        stub = _buyer_customer_stub if expected_role == "buyer" else _seller_customer_stub
-        info = stub.ValidateSession(
-            customer_pb2.SessionRequest(session_token=session_token)
-        )
-        if not info.valid or info.role != expected_role:
-            return False, 0
-        return True, int(info.principal_id)
-    except grpc.RpcError:
-        return False, 0
+    stubs = _buyer_customer_stubs if expected_role == "buyer" else _seller_customer_stubs
+    for stub in stubs:
+        try:
+            info = stub.ValidateSession(
+                customer_pb2.SessionRequest(session_token=session_token)
+            )
+            if not info.valid or info.role != expected_role:
+                return False, 0
+            return True, int(info.principal_id)
+        except grpc.RpcError:
+            continue
+    return False, 0
 
 
 def _item_to_proto(it: dict) -> product_pb2.ItemResponse:
@@ -77,6 +87,43 @@ def _cart_item_to_proto(ci: dict) -> product_pb2.CartItem:
     )
 
 
+def _apply_product_mutation(payload: dict[str, object]) -> dict:
+    role = str(payload.get("role") or "")
+    action = str(payload.get("action") or "")
+    data = dict(payload.get("data") or {})
+
+    if role == "seller":
+        return asyncio.run(seller.handle(_SHARED_STATE, {
+            "req_id": f"raft_{action}",
+            "action": action,
+            "data": data,
+        }))
+
+    if role == "buyer":
+        return asyncio.run(buyer.handle(_SHARED_STATE, {
+            "req_id": f"raft_{action}",
+            "action": action,
+            "data": data,
+        }))
+
+    raise ValueError(f"unsupported product mutation: role={role} action={action}")
+
+
+def _write_runtime_status(replica_id: int) -> None:
+    runtime_dir = cfg.storage.data_dir / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    runtime_file = runtime_dir / f"product-db-{replica_id}.json"
+    while True:
+        snapshot = _RAFT_NODE.snapshot() if _RAFT_NODE is not None else {"is_leader": False, "role": "standalone"}
+        payload = {
+            "pid": os.getpid(),
+            "replica_id": replica_id,
+            **snapshot,
+        }
+        runtime_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        time.sleep(0.5)
+
+
 class ProductService(product_pb2_grpc.ProductServiceServicer):
 
     def __init__(self, state: MarketState):
@@ -84,6 +131,22 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
 
     def _run(self, handler, req_dict):
         return asyncio.run(handler(self.state, req_dict))
+
+    def _require_leader(self, context):
+        if _RAFT_NODE is not None and not _RAFT_NODE.is_leader():
+            context.abort(grpc.StatusCode.UNAVAILABLE, "product replica is not the leader")
+
+    def _replicate(self, context, payload: dict) -> dict:
+        if _RAFT_NODE is None:
+            return _apply_product_mutation(payload)
+        try:
+            return _RAFT_NODE.submit(payload)
+        except NotLeaderError as exc:
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+        except TimeoutError as exc:
+            context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, str(exc))
+        except Exception as exc:
+            context.abort(grpc.StatusCode.INTERNAL, str(exc))
 
     def _ensure_local_session(self, token: str, principal_id: int, role: str):
         import time
@@ -118,14 +181,15 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
     # ==================================================
 
     def RegisterItem(self, request, context):
+        self._require_leader(context)
         valid, seller_id = validate_session(request.session_token, "seller")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, seller_id, "seller")
         self._ensure_seller(seller_id)
 
-        resp = self._run(seller.handle, {
-            "req_id": "grpc_register_item",
+        resp = self._replicate(context, {
+            "role": "seller",
             "action": "RegisterItemForSale",
             "data": {
                 "item_name": request.name,
@@ -135,7 +199,7 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
                 "keywords": [],
                 "condition": "new",
                 "session_token": request.session_token,
-            }
+            },
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
@@ -145,38 +209,43 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
         )
 
     def ChangePrice(self, request, context):
+        self._require_leader(context)
         valid, seller_id = validate_session(request.session_token, "seller")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, seller_id, "seller")
         self._ensure_seller(seller_id)
 
-        resp = self._run(seller.handle, {
-            "req_id": "grpc_change_price", "action": "ChangeItemPrice",
+        resp = self._replicate(context, {
+            "role": "seller",
+            "action": "ChangeItemPrice",
             "data": {"item_id": request.item_id, "new_price": request.new_price,
-                     "session_token": request.session_token}
+                     "session_token": request.session_token},
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
         return product_pb2.Empty()
 
     def UpdateQuantity(self, request, context):
+        self._require_leader(context)
         valid, seller_id = validate_session(request.session_token, "seller")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, seller_id, "seller")
         self._ensure_seller(seller_id)
 
-        resp = self._run(seller.handle, {
-            "req_id": "grpc_update_quantity", "action": "UpdateUnitsForSale",
+        resp = self._replicate(context, {
+            "role": "seller",
+            "action": "UpdateUnitsForSale",
             "data": {"item_id": request.item_id, "quantity": request.quantity,
-                     "session_token": request.session_token}
+                     "session_token": request.session_token},
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
         return product_pb2.Empty()
 
     def DisplayItemsForSale(self, request, context):
+        self._require_leader(context)
         valid, seller_id = validate_session(request.session_token, "seller")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
@@ -197,6 +266,7 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
     # ==================================================
 
     def SearchItems(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
@@ -213,6 +283,7 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
         return product_pb2.ItemList(items=[_item_to_proto(it) for it in resp["data"]["items"]])
 
     def GetItem(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
@@ -233,68 +304,77 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
     # ==================================================
 
     def AddToCart(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, buyer_id, "buyer")
         self._ensure_buyer(buyer_id)
 
-        resp = self._run(buyer.handle, {
-            "req_id": "grpc_add_to_cart", "action": "AddItemToCart",
+        resp = self._replicate(context, {
+            "role": "buyer",
+            "action": "AddItemToCart",
             "data": {"item_id": request.item_id, "quantity": request.quantity,
-                     "session_token": request.session_token}
+                     "session_token": request.session_token},
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
         return product_pb2.Empty()
 
     def RemoveFromCart(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, buyer_id, "buyer")
         self._ensure_buyer(buyer_id)
 
-        resp = self._run(buyer.handle, {
-            "req_id": "grpc_remove_from_cart", "action": "RemoveItemFromCart",
+        resp = self._replicate(context, {
+            "role": "buyer",
+            "action": "RemoveItemFromCart",
             "data": {"item_id": request.item_id, "quantity": request.quantity,
-                     "session_token": request.session_token}
+                     "session_token": request.session_token},
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
         return product_pb2.Empty()
 
     def SaveCart(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, buyer_id, "buyer")
         self._ensure_buyer(buyer_id)
 
-        resp = self._run(buyer.handle, {
-            "req_id": "grpc_save_cart", "action": "SaveCart",
-            "data": {"session_token": request.session_token}
+        resp = self._replicate(context, {
+            "role": "buyer",
+            "action": "SaveCart",
+            "data": {"session_token": request.session_token},
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
         return product_pb2.Empty()
 
     def ClearCart(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, buyer_id, "buyer")
         self._ensure_buyer(buyer_id)
 
-        resp = self._run(buyer.handle, {
-            "req_id": "grpc_clear_cart", "action": "ClearCart",
-            "data": {"session_token": request.session_token}
+        resp = self._replicate(context, {
+            "role": "buyer",
+            "action": "ClearCart",
+            "data": {"session_token": request.session_token},
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
         return product_pb2.Empty()
 
     def GetCart(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
@@ -317,16 +397,18 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
     # ==================================================
 
     def ProvideFeedback(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, buyer_id, "buyer")
         self._ensure_buyer(buyer_id)
 
-        resp = self._run(buyer.handle, {
-            "req_id": "grpc_provide_feedback", "action": "ProvideFeedback",
+        resp = self._replicate(context, {
+            "role": "buyer",
+            "action": "ProvideFeedback",
             "data": {"item_id": request.item_id, "feedback": request.feedback,
-                     "session_token": request.session_token}
+                     "session_token": request.session_token},
         })
         if not resp.get("ok"):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
@@ -337,15 +419,20 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
     # ==================================================
 
     def FinalizePurchase(self, request, context):
+        self._require_leader(context)
         valid, buyer_id = validate_session(request.session_token, "buyer")
         if not valid:
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or expired session")
         self._ensure_local_session(request.session_token, buyer_id, "buyer")
         self._ensure_buyer(buyer_id)
 
-        resp = self._run(buyer.handle, {
-            "req_id": "grpc_finalize_purchase", "action": "MakePurchase",
-            "data": {"session_token": request.session_token}
+        resp = self._replicate(context, {
+            "role": "buyer",
+            "action": "MakePurchase",
+            "data": {
+                "session_token": request.session_token,
+                "txn_id": f"txn_{uuid.uuid4().hex[:12]}",
+            },
         })
         if not resp.get("ok"):
             return product_pb2.PurchaseResult(
@@ -357,12 +444,17 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
                 line.get("qty", 1)
                 for line in resp["data"]["transaction"].get("items", [])
             )
-            _buyer_customer_stub.RecordPurchase(
-                customer_pb2.RecordPurchaseRequest(
-                    session_token=request.session_token,
-                    total_units=total_units
-                )
-            )
+            for stub in _buyer_customer_stubs:
+                try:
+                    stub.RecordPurchase(
+                        customer_pb2.RecordPurchaseRequest(
+                            session_token=request.session_token,
+                            total_units=total_units
+                        )
+                    )
+                    break
+                except grpc.RpcError:
+                    continue
         except grpc.RpcError:
             pass
 
@@ -372,7 +464,22 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
 
 
 def serve():
-    port = cfg.backend_product_db.port
+    global _RAFT_NODE
+    replicas = cfg.backend_product_db.targets()
+    raft_members = [(replica.host, replica.port + 1000) for replica in replicas]
+    member_id = max(0, min(args.replica_id, len(raft_members) - 1))
+    port = replicas[member_id].port
+    if raft_members:
+        my_host, my_raft_port = raft_members[member_id]
+        _RAFT_NODE = SimpleRaftNode(
+            member_id=member_id,
+            members=raft_members,
+            apply_fn=_apply_product_mutation,
+            udp_host=my_host,
+            udp_port=my_raft_port,
+        )
+        _RAFT_NODE.start()
+        threading.Thread(target=_write_runtime_status, args=(member_id,), daemon=True).start()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=20))
     product_pb2_grpc.add_ProductServiceServicer_to_server(
         ProductService(_SHARED_STATE), server

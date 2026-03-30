@@ -6,8 +6,16 @@ class MarketplaceClient:
     Base REST client for Buyer and Seller CLI (PA2).
     """
 
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: str | list[str] | tuple[str, ...]):
+        if isinstance(base_url, (list, tuple)):
+            urls = [str(u).rstrip("/") for u in base_url if str(u).strip()]
+        else:
+            urls = [str(base_url).rstrip("/")]
+        if not urls:
+            raise ValueError("at least one frontend URL is required")
+        self.base_urls = urls
+        self.base_url = self.base_urls[0]
+        self._replica_index = 0
         self.session_id = None
 
     # ---------------------------------
@@ -30,16 +38,27 @@ class MarketplaceClient:
             payload = dict(payload)
             payload["session_token"] = self.session_id
 
-        url = f"{self.base_url}/{endpoint}"
+        errors: list[str] = []
+        response = None
+        for offset in range(len(self.base_urls)):
+            idx = (self._replica_index + offset) % len(self.base_urls)
+            base_url = self.base_urls[idx]
+            url = f"{base_url}/{endpoint}"
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    timeout=10
+                )
+                self._replica_index = idx
+                self.base_url = base_url
+                break
+            except requests.exceptions.RequestException as e:
+                errors.append(f"{base_url}: {e}")
+                continue
 
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                timeout=10  # important for performance testing
-            )
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Connection error: {e}")
+        if response is None:
+            raise Exception("All frontend replicas failed: " + " | ".join(errors))
 
         if response.status_code != 200:
             raise Exception(
