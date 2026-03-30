@@ -116,9 +116,18 @@ def seller_workload(
     client = MarketplaceClient(base_url)
     username = f"seller_{RUN_TAG}_r{run_idx}_{seller_idx}"
 
-    timed_call(client, "seller/create_account", {"username": username, "password": "pw"}, stats)
+    ca_resp = timed_call(client, "seller/create_account", {"username": username, "password": "pw"}, stats)
+    seller_id_for_login = ca_resp.get("seller_id")
 
-    resp = timed_call(client, "seller/login", {"username": username, "password": "pw"}, stats)
+    if seller_id_for_login is not None:
+        resp = timed_call(
+            client,
+            "seller/login",
+            {"username": f"__id__:{int(seller_id_for_login)}", "password": "pw"},
+            stats,
+        )
+    else:
+        resp = timed_call(client, "seller/login", {"username": username, "password": "pw"}, stats)
     session_token = resp.get("session_token", "")
     seller_id = resp.get("seller_id")
     client.set_session(session_token)
@@ -194,8 +203,17 @@ def buyer_workload(
     client = MarketplaceClient(base_url)
     username = f"buyer_{RUN_TAG}_r{run_idx}_{buyer_idx}"
 
-    timed_call(client, "buyer/create_account", {"username": username, "password": "pw"}, stats)
-    resp = timed_call(client, "buyer/login", {"username": username, "password": "pw"}, stats)
+    ca_resp = timed_call(client, "buyer/create_account", {"username": username, "password": "pw"}, stats)
+    buyer_id_for_login = ca_resp.get("buyer_id")
+    if buyer_id_for_login is not None:
+        resp = timed_call(
+            client,
+            "buyer/login",
+            {"username": f"__id__:{int(buyer_id_for_login)}", "password": "pw"},
+            stats,
+        )
+    else:
+        resp = timed_call(client, "buyer/login", {"username": username, "password": "pw"}, stats)
     session_token = resp.get("session_token", "")
     client.set_session(session_token)
 
