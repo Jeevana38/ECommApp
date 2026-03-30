@@ -1,0 +1,52 @@
+### VM Setup
+
+#### VM1
+```bash
+python -m src.backend.customer_grpc_server --config config/local.yaml --replica-id 0
+python -m src.backend.product_grpc_server --config config/local.yaml --replica-id 0
+python run_seller_server.py --config config/local.yaml --replica-id 0
+python run_buyer_server.py --config config/local.yaml --replica-id 0
+```
+
+#### VM2
+```bash
+python -m src.backend.customer_grpc_server --config config/local.yaml --replica-id 1
+python -m src.backend.product_grpc_server --config config/local.yaml --replica-id 1
+python run_seller_server.py --config config/local.yaml --replica-id 1
+python run_buyer_server.py --config config/local.yaml --replica-id 1
+```
+
+#### VM3
+```bash
+python -m src.backend.customer_grpc_server --config config/local.yaml --replica-id 2
+python -m src.backend.product_grpc_server --config config/local.yaml --replica-id 2
+python run_seller_server.py --config config/local.yaml --replica-id 2
+python run_buyer_server.py --config config/local.yaml --replica-id 2
+```
+
+#### VM4
+```bash
+python -m src.financial.soap_server --config config/local.yaml
+
+python -m src.backend.customer_grpc_server --config config/local.yaml --replica-id 3
+python -m src.backend.customer_grpc_server --config config/local.yaml --replica-id 4
+
+python -m src.backend.product_grpc_server --config config/local.yaml --replica-id 3
+python -m src.backend.product_grpc_server --config config/local.yaml --replica-id 4
+
+python run_seller_server.py --config config/local.yaml --replica-id 3
+python run_buyer_server.py --config config/local.yaml --replica-id 3
+```
+
+---
+
+## Startup Sequence
+
+
+1. Start **SOAP service** on `VM4`
+2. Start all **Customer DB replicas** across all VMs
+3. Start all **Product DB replicas** across all VMs
+4. Wait a few seconds for **Raft leader election**
+5. Start all **Seller frontend replicas**
+6. Start all **Buyer frontend replicas**
+7. Run CLI or benchmarks from any machine that can reach the frontend replica IPs
