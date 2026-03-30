@@ -11,7 +11,7 @@ from src.common.config import load_config
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
-args = parser.parse_args()
+args, _unknown = parser.parse_known_args()
 
 cfg = load_config(args.config)
 app = FastAPI()
