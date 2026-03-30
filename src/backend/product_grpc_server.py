@@ -10,9 +10,9 @@ import asyncio
 import grpc
 import json
 import os
+import time
 import uuid
 import threading
-import time
 from concurrent import futures
 
 from src.proto import product_pb2, product_pb2_grpc
@@ -47,16 +47,20 @@ _RAFT_NODE: SimpleRaftNode | None = None
 
 def validate_session(session_token: str, expected_role: str) -> tuple[bool, int]:
     stubs = _buyer_customer_stubs if expected_role == "buyer" else _seller_customer_stubs
-    for stub in stubs:
-        try:
-            info = stub.ValidateSession(
-                customer_pb2.SessionRequest(session_token=session_token)
-            )
-            if not info.valid or info.role != expected_role:
-                return False, 0
-            return True, int(info.principal_id)
-        except grpc.RpcError:
-            continue
+    for _attempt in range(3):
+        saw_invalid = False
+        for stub in stubs:
+            try:
+                info = stub.ValidateSession(
+                    customer_pb2.SessionRequest(session_token=session_token)
+                )
+                if info.valid and info.role == expected_role:
+                    return True, int(info.principal_id)
+                saw_invalid = True
+            except grpc.RpcError:
+                continue
+        if not saw_invalid:
+            time.sleep(0.1)
     return False, 0
 
 
