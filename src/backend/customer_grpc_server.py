@@ -36,6 +36,15 @@ def _debug(message: str) -> None:
     print(f"[customer-replica {args.replica_id}] {message}", flush=True)
 
 
+def _login_data_from_request(username: str, password: str, role: str) -> dict:
+    raw_username = str(username)
+    if raw_username.startswith("__id__:"):
+        numeric_id = int(raw_username.split(":", 1)[1])
+        id_key = "buyer_id" if role == "buyer" else "seller_id"
+        return {id_key: numeric_id, "password": password}
+    return {"username": raw_username, "password": password}
+
+
 def _apply_customer_operation(payload: dict) -> dict:
     role = str(payload.get("role") or "")
     action = str(payload.get("action") or "")
@@ -108,8 +117,7 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
             "role": "buyer",
             "action": "Login",
             "data": {
-                "username": request.username,
-                "password": request.password,
+                **_login_data_from_request(request.username, request.password, "buyer"),
                 "session_token": uuid.uuid4().hex,
             },
         })
@@ -218,8 +226,7 @@ class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
             "role": "seller",
             "action": "Login",
             "data": {
-                "username": request.username,
-                "password": request.password,
+                **_login_data_from_request(request.username, request.password, "seller"),
                 "session_token": uuid.uuid4().hex,
             },
         })
@@ -316,3 +323,4 @@ def serve():
 
 if __name__ == "__main__":
     serve()
+
