@@ -19,7 +19,7 @@ from src.proto import product_pb2, product_pb2_grpc
 from src.proto import customer_pb2, customer_pb2_grpc
 from src.server.state import MarketState
 from src.server.handlers import buyer, seller
-from src.common.models import Seller, Buyer
+from src.common.models import Seller, Buyer, ItemId
 from src.replication.simple_raft import NotLeaderError, SimpleRaftNode
 
 import argparse
@@ -463,6 +463,28 @@ class ProductService(product_pb2_grpc.ProductServiceServicer):
         if not resp.get("ok"):
             _debug(f"ProvideFeedback handler error: {resp.get('error', 'error')}")
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, resp.get("error", "error"))
+
+        seller_id = 0
+        local_item = asyncio.run(self.state.db.get_item(ItemId.from_any(request.item_id)))
+        if local_item is not None:
+            seller_id = int(local_item.seller_id)
+
+        vote = str(request.feedback or "").strip().lower()
+        thumbs_up = 1 if vote in {"up", "thumbs_up", "thumbsup", "1"} else 0
+        thumbs_down = 1 if vote in {"down", "thumbs_down", "thumbsdown", "-1"} else 0
+        if seller_id:
+            for stub in _buyer_customer_stubs:
+                try:
+                    stub.RecordSellerFeedback(
+                        customer_pb2.RecordSellerFeedbackRequest(
+                            seller_id=seller_id,
+                            thumbs_up=thumbs_up,
+                            thumbs_down=thumbs_down,
+                        )
+                    )
+                    break
+                except grpc.RpcError:
+                    continue
         return product_pb2.Empty()
 
     # ==================================================
