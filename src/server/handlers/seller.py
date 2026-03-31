@@ -90,7 +90,8 @@ async def handle(state: MarketState, req: Dict[str, Any]) -> Dict[str, Any]:
         # GetSellerRating
         # ------------------------------
         if action in {"get_seller_rating", "GetSellerRating"}:
-            s = await state.db.get_seller(seller_id)
+            requested_seller_id = int(data.get("seller_id") if data.get("seller_id") is not None else seller_id)
+            s = await state.db.get_seller(requested_seller_id)
             if not s:
                 return err(req_id, "seller not found")
             return ok(req_id, {"seller_id": int(s.seller_id), "seller_feedback": s.feedback.to_dict()})
