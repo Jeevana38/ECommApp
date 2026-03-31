@@ -80,6 +80,15 @@ def _apply_customer_operation(payload: dict) -> dict:
         _debug("RecordPurchase applied successfully")
         return {"ok": True, "data": {"recorded": True}}
 
+    if role == "system" and action == "RecordSellerFeedback":
+        asyncio.run(_SHARED_STATE.db.add_seller_feedback(
+            int(data.get("seller_id", 0)),
+            thumbs_up=int(data.get("thumbs_up", 0)),
+            thumbs_down=int(data.get("thumbs_down", 0)),
+        ))
+        _debug("RecordSellerFeedback applied successfully")
+        return {"ok": True, "data": {"recorded": True}}
+
     raise ValueError(f"unsupported customer mutation: role={role} action={action}")
 
 
@@ -199,6 +208,26 @@ class CustomerService(customer_pb2_grpc.CustomerServiceServicer):
             context.abort(grpc.StatusCode.UNAUTHENTICATED, str(exc))
         return customer_pb2.Empty()
 
+    def RecordSellerFeedback(self, request, context):
+        try:
+            _debug(
+                f"RecordSellerFeedback request seller_id={request.seller_id} "
+                f"up={request.thumbs_up} down={request.thumbs_down}"
+            )
+            _broadcast_customer_mutation({
+                "role": "system",
+                "action": "RecordSellerFeedback",
+                "data": {
+                    "seller_id": request.seller_id,
+                    "thumbs_up": request.thumbs_up,
+                    "thumbs_down": request.thumbs_down,
+                },
+            })
+        except Exception as exc:
+            _debug(f"RecordSellerFeedback failed error={exc}")
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+        return customer_pb2.Empty()
+
 
 class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
     """Handles seller account operations — same shared state as buyer service."""
@@ -280,6 +309,9 @@ class SellerCustomerService(customer_pb2_grpc.CustomerServiceServicer):
     def RecordPurchase(self, request, context):
         context.abort(grpc.StatusCode.UNIMPLEMENTED, "not applicable for sellers")
 
+    def RecordSellerFeedback(self, request, context):
+        context.abort(grpc.StatusCode.UNIMPLEMENTED, "not applicable for sellers")
+
 
 def serve():
     global _CUSTOMER_GROUP
@@ -323,4 +355,3 @@ def serve():
 
 if __name__ == "__main__":
     serve()
-
