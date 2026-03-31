@@ -56,11 +56,11 @@ async def _do_purchase(state: MarketState, buyer_id: int, txn_id: str | None = N
     if not buyer:
         raise ValueError("buyer not found")
 
-    # Load and atomically clear cart from DB
+    # Load the persisted cart. We only clear it after a successful purchase
+    # so a failed checkout does not destroy the buyer's pending items.
     cart = await state.get_cart(int(buyer_id))
     if not cart:
         raise ValueError("cart is empty")
-    await state.clear_cart(int(buyer_id))
 
     total = 0.0
     lines: List[TransactionLine] = []
@@ -107,6 +107,7 @@ async def _do_purchase(state: MarketState, buyer_id: int, txn_id: str | None = N
         total=total,
     )
     await state.db.add_transaction(txn)
+    await state.clear_cart(int(buyer_id))
     return {"transaction": txn.to_public_dict()}
 
 
@@ -319,6 +320,7 @@ async def handle(state: MarketState, req: Dict[str, Any]) -> Dict[str, Any]:
             await state.db.add_item_feedback(item_id, thumbs_up=up, thumbs_down=down)
             it = await state.db.get_item(item_id)
             assert it is not None
+            await state.db.add_seller_feedback(int(it.seller_id), thumbs_up=up, thumbs_down=down)
             return ok(req_id, {"item_id": item_id.to_dict(), "item_feedback": it.feedback.to_dict()})
 
         # ------------------------------
