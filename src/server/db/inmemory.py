@@ -140,6 +140,18 @@ class InMemoryDB:
                 raise ValueError("buyer not found")
             b.items_purchased = int(b.items_purchased) + int(delta)
 
+    async def add_seller_feedback(self, seller_id: int, thumbs_up: int = 0, thumbs_down: int = 0) -> None:
+        up = int(thumbs_up)
+        down = int(thumbs_down)
+        if up < 0 or down < 0:
+            raise ValueError("feedback deltas must be >= 0")
+        async with self.lock:
+            seller = self.sellers_by_id.get(int(seller_id))
+            if not seller:
+                raise ValueError("seller not found")
+            seller.feedback.thumbs_up = int(seller.feedback.thumbs_up) + up
+            seller.feedback.thumbs_down = int(seller.feedback.thumbs_down) + down
+
     # ------------------------------
     # Items
     # ------------------------------
