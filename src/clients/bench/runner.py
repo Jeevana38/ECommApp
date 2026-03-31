@@ -351,14 +351,23 @@ def run_one(
     items_per_seller: int,
     seed: int,
     run_idx: int,
+    progress_label: str = "run",
 ) -> Tuple[float, float, RunStats]:
     shared_item_ids: List[str] = []
     shared_seller_ids: List[int] = []
     shared_lock = threading.Lock()
-    seller_futures = []
-    buyer_futures = []
+    seller_futures: list[concurrent.futures.Future] = []
+    buyer_futures: list[concurrent.futures.Future] = []
+    seller_results: list[Tuple[RunStats, List[str]]] = []
+    buyer_results: list[RunStats] = []
 
     t0 = time.perf_counter()
+    total_clients = n_sellers + n_buyers
+    print(
+        f"[bench] {progress_label}: starting {n_sellers} sellers + {n_buyers} buyers "
+        f"with {ops_per_client} ops/client",
+        flush=True,
+    )
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_sellers + n_buyers) as executor:
         for i in range(n_sellers):
             seller_futures.append(
@@ -388,14 +397,28 @@ def run_one(
                     shared_seller_ids,
                 )
             )
+        all_futures = seller_futures + buyer_futures
+        completed = 0
+        last_report = time.perf_counter()
+        for future in concurrent.futures.as_completed(all_futures):
+            completed += 1
+            if future in seller_futures:
+                seller_results.append(future.result())
+            else:
+                buyer_results.append(future.result())
+            now = time.perf_counter()
+            if completed == total_clients or now - last_report >= 5.0:
+                print(
+                    f"[bench] {progress_label}: clients finished {completed}/{total_clients}",
+                    flush=True,
+                )
+                last_report = now
     duration = time.perf_counter() - t0
 
     all_stats = RunStats()
-    for future in seller_futures:
-        st, _ = future.result()
+    for st, _ in seller_results:
         all_stats.merge(st)
-    for future in buyer_futures:
-        st = future.result()
+    for st in buyer_results:
         all_stats.merge(st)
 
     total_ops = (n_buyers + n_sellers) * ops_per_client
@@ -444,6 +467,13 @@ def main() -> None:
     buyer_base_url = [f"http://{replica.host}:{replica.port}" for replica in cfg.frontend_buyer.targets()]
     seller_base_url = [f"http://{replica.host}:{replica.port}" for replica in cfg.frontend_seller.targets()]
 
+    print(
+        f"[bench] scenario={args.scenario} sellers={n_sellers} buyers={n_buyers} "
+        f"runs={args.runs} ops_per_client={args.ops_per_client} "
+        f"items_per_seller={args.items_per_seller} warmup={args.warmup}",
+        flush=True,
+    )
+
     for w in range(args.warmup):
         run_one(
             buyer_base_url,
@@ -454,6 +484,7 @@ def main() -> None:
             items_per_seller=max(1, min(2, args.items_per_seller)),
             seed=args.seed + 9999 + w,
             run_idx=-(w + 1),
+            progress_label=f"warmup {w + 1}/{args.warmup}",
         )
 
     run_avgs: List[float] = []
@@ -471,6 +502,7 @@ def main() -> None:
             items_per_seller=args.items_per_seller,
             seed=args.seed + r * 17,
             run_idx=r,
+            progress_label=f"run {r + 1}/{args.runs}",
         )
         if failure_thread is not None:
             failure_thread.join(timeout=args.failure_delay + 1.0)
