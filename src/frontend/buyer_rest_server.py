@@ -46,7 +46,11 @@ def _call_any(stubs, method_name: str, request):
         try:
             return getattr(stub, method_name)(request)
         except grpc.RpcError as exc:
+            detail = (exc.details() or "").lower() if hasattr(exc, "details") else ""
+            code = exc.code() if hasattr(exc, "code") else None
             last_error = exc
+            if "not the leader" in detail or code == grpc.StatusCode.UNAVAILABLE:
+                continue
     if last_error is not None:
         raise last_error
     raise RuntimeError("no backend stubs configured")
